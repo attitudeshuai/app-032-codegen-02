@@ -23,9 +23,15 @@ import {
 import { groupMembers } from '../core/frame'
 import { kindName, shapeName } from '../core/exporter'
 import { coveringLabel, kindLabel, styleLabel } from '../core/craft'
-import type { Panel } from '../core/types'
+import type { Panel, PatternCapCut, PatternCutPiece } from '../core/types'
 
 type PrintMode = 'loft' | 'frame' | 'labels'
+
+/** 裁片标签记录：未启用取料时一种一片；启用后逐片（下刀段各不相同） */
+type LabelRec =
+  | { kind: 'panel'; panel: Panel }
+  | { kind: 'cut'; panel: Panel; piece: PatternCutPiece }
+  | { kind: 'cap'; panel: Panel; cap: PatternCapCut }
 
 const route = useRoute()
 const router = useRouter()
@@ -95,9 +101,24 @@ onUnmounted(() => {
 })
 
 const labelPages = computed(() => {
-  const list = full.value?.panels.panels ?? []
-  const out: Panel[][] = []
-  for (let i = 0; i < list.length; i += 10) out.push(list.slice(i, i + 10))
+  const recs: LabelRec[] = []
+  const f = full.value
+  if (f && f.pattern.enabled && f.pattern.valid) {
+    // 按花纹周期取料：逐片出标签，下刀段/花位/对位标记与裁片页、作坊清单同签名
+    const capPanel = new Map(f.panels.panels.filter((p) => p.layerIndex < 0).map((p) => [p.id, p]))
+    for (const ly of f.pattern.layers) {
+      const panel = f.panels.panels.find((p) => p.id === ly.pieces[0]?.panelId)
+      for (const pc of ly.pieces) if (panel) recs.push({ kind: 'cut', panel, piece: pc })
+    }
+    for (const c of f.pattern.caps) {
+      const panel = capPanel.get(c.panelId)
+      if (panel) recs.push({ kind: 'cap', panel, cap: c })
+    }
+  } else {
+    for (const p of f?.panels.panels ?? []) recs.push({ kind: 'panel', panel: p })
+  }
+  const out: LabelRec[][] = []
+  for (let i = 0; i < recs.length; i += 10) out.push(recs.slice(i, i + 10))
   return out.length ? out : [[]]
 })
 
@@ -621,27 +642,69 @@ function today(): string {
     <!-- ============ 裁片标签 ============ -->
     <section v-if="mode === 'labels'" v-for="(page, pi) in labelPages" :key="'lp' + pi" class="label-page">
       <div class="label-grid">
-        <div v-for="p in page" :key="p.id" class="label">
-          <div class="lb-head">
-            <span class="lb-code">{{ p.id }}</span>
-            <span class="lb-name">{{ p.label }}</span>
-            <span class="lb-qty">× {{ p.qty }} 块</span>
-          </div>
-          <div class="lb-rows">
-            <div><span>形状</span><b>{{ shapeName(p.shape) }}{{ p.polySides ? `（正 ${p.polySides} 边形）` : '' }}</b></div>
-            <div><span>净尺寸</span><b>上 {{ f1(p.rawWidthTopMm) }} / 下 {{ f1(p.rawWidthBottomMm) }} × 高 {{ f1(p.rawHeightMm) }} mm</b></div>
-            <div><span>裁切尺寸</span><b>上 {{ f1(p.widthTopMm) }} / 下 {{ f1(p.widthBottomMm) }} × 高 {{ f1(p.heightMm) }} mm</b></div>
-            <div><span>缝份</span><b>四边各 {{ p.seamAllowanceMm }}mm（已计入裁切尺寸）</b></div>
-            <div>
-              <span>位置 / 配色</span><b>{{ p.layerIndex >= 0 ? `第 ${p.layerIndex + 1} 层` : '顶/底盖' }} · {{ p.color }}</b>
+        <!-- 未启用取料：按裁片种类出标签 -->
+        <template v-for="rec in page" :key="rec.kind + (rec.kind === 'panel' ? rec.panel.id : rec.kind === 'cut' ? `L${rec.piece.layerIndex}-${rec.piece.pieceIndex}` : rec.cap.panelId)">
+          <div v-if="rec.kind === 'panel'" class="label">
+            <div class="lb-head">
+              <span class="lb-code">{{ rec.panel.id }}</span>
+              <span class="lb-name">{{ rec.panel.label }}</span>
+              <span class="lb-qty">× {{ rec.panel.qty }} 块</span>
             </div>
-            <div><span>对位标记</span><b>{{ p.marksMm.length }} 处（见 1:1 图十字编号）</b></div>
+            <div class="lb-rows">
+              <div><span>形状</span><b>{{ shapeName(rec.panel.shape) }}{{ rec.panel.polySides ? `（正 ${rec.panel.polySides} 边形）` : '' }}</b></div>
+              <div><span>净尺寸</span><b>上 {{ f1(rec.panel.rawWidthTopMm) }} / 下 {{ f1(rec.panel.rawWidthBottomMm) }} × 高 {{ f1(rec.panel.rawHeightMm) }} mm</b></div>
+              <div><span>裁切尺寸</span><b>上 {{ f1(rec.panel.widthTopMm) }} / 下 {{ f1(rec.panel.widthBottomMm) }} × 高 {{ f1(rec.panel.heightMm) }} mm</b></div>
+              <div><span>缝份</span><b>四边各 {{ rec.panel.seamAllowanceMm }}mm（已计入裁切尺寸）</b></div>
+              <div>
+                <span>位置 / 配色</span><b>{{ rec.panel.layerIndex >= 0 ? `第 ${rec.panel.layerIndex + 1} 层` : '顶/底盖' }} · {{ rec.panel.color }}</b>
+              </div>
+              <div><span>对位标记</span><b>{{ rec.panel.marksMm.length }} 处（见 1:1 图十字编号）</b></div>
+            </div>
+            <div class="lb-foot">
+              {{ lantern.name }} · 蒙面 {{ coveringLabel(lantern.covering) }} · 逐块编号
+              {{ rec.panel.id }}-01 … {{ rec.panel.id }}-{{ String(rec.panel.qty).padStart(2, '0') }}
+            </div>
           </div>
-          <div class="lb-foot">
-            {{ lantern.name }} · 蒙面 {{ coveringLabel(lantern.covering) }} · 逐块编号
-            {{ p.id }}-01 … {{ p.id }}-{{ String(p.qty).padStart(2, '0') }}
+
+          <!-- 启用取料：逐片标签，下刀段/花位/缝偏差与清单同一份结果 -->
+          <div v-else-if="rec.kind === 'cut'" class="label cut-label" :class="{ closing: rec.piece.closing }">
+            <div class="lb-head">
+              <span class="lb-code">{{ rec.panel.id }}-{{ String(rec.piece.pieceIndex + 1).padStart(2, '0') }}</span>
+              <span class="lb-name">{{ rec.piece.label }}</span>
+              <span class="lb-qty">{{ rec.piece.closing ? '合围片' : '围片' }}</span>
+            </div>
+            <div class="lb-rows">
+              <div><span>卷上下刀段</span><b>{{ f1(rec.piece.rollFromMm) }} ~ {{ f1(rec.piece.rollToMm) }} mm（第 {{ rec.piece.shelfIndex + 1 }} 幅宽排）</b></div>
+              <div><span>下刀段长</span><b>{{ f1(rec.piece.cutLengthMm) }}mm ＝ 净宽 {{ f1(rec.piece.netWidthBottomMm) }} ＋ 缝份 {{ full.pattern.seamAllowanceMm }}×2<template v-if="rec.piece.closing"> ＋ 搭接 {{ full.pattern.spec.lapMm }}</template></b></div>
+              <div><span>左净边花位</span><b>{{ f1(rec.piece.phaseStartMm) }} / {{ full.pattern.spec.repeatMm }} mm（{{ (rec.piece.phaseStartRatio * 100).toFixed(2) }}%）</b></div>
+              <div>
+                <span>拼缝</span>
+                <b>{{ rec.piece.seam.label }}：偏差 下 {{ f1(rec.piece.seam.mismatchBottomMm) }} / 上 {{ f1(rec.piece.seam.mismatchTopMm) }}mm</b>
+              </div>
+              <div v-if="rec.piece.gapBeforeMm || rec.piece.headSkipMm">
+                <span>空让布头</span><b>{{ f1(rec.piece.gapBeforeMm + rec.piece.headSkipMm) }}mm（保花纹路线）</b>
+              </div>
+              <div><span>对位/花位标记</span><b class="marks-inline">{{ rec.piece.marksMm.map((m) => m.label).join('；') }}</b></div>
+            </div>
+            <div class="lb-foot">
+              {{ lantern.name }} · 周期 {{ full.pattern.spec.repeatMm }} · 同源签名 {{ full.pattern.signature }}
+            </div>
           </div>
-        </div>
+
+          <div v-else class="label cap-label">
+            <div class="lb-head">
+              <span class="lb-code">{{ rec.panel.id }}</span>
+              <span class="lb-name">{{ rec.cap.label }}</span>
+              <span class="lb-qty">盖片</span>
+            </div>
+            <div class="lb-rows">
+              <div><span>卷上下刀段</span><b>{{ f1(rec.cap.rollFromMm) }} ~ {{ f1(rec.cap.rollToMm) }} mm（第 {{ rec.cap.shelfIndex + 1 }} 幅宽排）</b></div>
+              <div><span>下刀尺寸</span><b>{{ f1(rec.cap.cutLengthMm) }} × {{ f1(rec.cap.cutCrossMm) }} mm（含折边，不参与对花）</b></div>
+              <div><span>位置 / 配色</span><b>顶/底盖 · {{ rec.cap.color }}</b></div>
+            </div>
+            <div class="lb-foot">{{ lantern.name }} · 同源签名 {{ full.pattern.signature }}</div>
+          </div>
+        </template>
       </div>
     </section>
 
@@ -1092,6 +1155,26 @@ button.primary:hover {
   gap: 1mm;
   overflow: hidden;
   background: #fff;
+}
+
+.cut-label {
+  border-color: #b3241f;
+}
+
+.cut-label.closing {
+  border-style: solid;
+  background: #fff7f5;
+}
+
+.cap-label {
+  border-color: #2f7a63;
+}
+
+.marks-inline {
+  font-weight: 400;
+  font-size: 2.7mm;
+  line-height: 1.35;
+  display: block;
 }
 
 .lb-head {

@@ -1,8 +1,10 @@
 /**
  * 材料统计与备料单（规格书 §4.6 / §5）
  * 备料按含余量长度；批量 = 单灯 × N × (1 + 损耗率)。
+ * 绸布「按花纹周期取料」启用时，各色用布量取自同一份 PatternPlan（蒙面裁片页 /
+ * 材料页 / 作坊清单三处同源），不再用面积反推米数。
  */
-import type { FrameMember, Lantern } from './types'
+import type { FrameMember, Lantern, PatternColorRoll, PatternPlan } from './types'
 import { bodySurfaceArea, bodyVolume, r1, r3 } from './geometry'
 import { buildFrame } from './frame'
 import { buildPanels } from './panels'
@@ -29,6 +31,12 @@ export interface SingleLightMaterials {
   ledCount: number
   /** 灯体表面积（m²） */
   surfaceM2: number
+  /** 按花纹周期取料：各色卷料结算（启用时与裁片页/清单同源） */
+  fabricRolls: PatternColorRoll[]
+  /** 按花纹周期取料：单灯各色卷长合计（m；未启用为 null） */
+  fabricTotalM: number | null
+  /** 取料结果签名（三处同源凭据；未启用为 null） */
+  fabricSignature: string | null
 }
 
 export interface BatchMaterials extends SingleLightMaterials {
@@ -36,7 +44,7 @@ export interface BatchMaterials extends SingleLightMaterials {
   wasteRatio: number
 }
 
-export function computeMaterials(l: Lantern): SingleLightMaterials {
+export function computeMaterials(l: Lantern, pattern?: PatternPlan): SingleLightMaterials {
   const frame = buildFrame(l)
   const panelRes = buildPanels(l)
   const cov = coveringSpec(l.covering)
@@ -49,17 +57,27 @@ export function computeMaterials(l: Lantern): SingleLightMaterials {
   const volumeL = bodyVolume(frame.geometry) / 1_000_000
   const led = Math.max(CRAFT.led.min, Math.ceil(volumeL * CRAFT.led.perLiter))
 
+  // 按花纹周期取料启用且有效时，蒙面米数只认同一份取料计划（与裁片页/清单同源）
+  const usePattern = !!(pattern && pattern.enabled && pattern.valid)
+  const fabricRolls = usePattern
+    ? pattern.rolls.map((r) => ({ ...r, shelves: r.shelves.map((s) => ({ ...s })) }))
+    : []
+  const fabricTotalM = usePattern ? r3(pattern.totalRequiredMm / 1000) : null
+
   return {
     frameM: r3(frameMm / 1000),
     frameRawM: r3(frameRawMm / 1000),
-    coveringM2: r3(cutArea / 1_000_000),
+    coveringM2: usePattern ? pattern.totalRequiredM2 : r3(cutArea / 1_000_000),
     coveringNetM2: r3(panelRes.netAreaMm2 / 1_000_000),
     lashM: r3(joints * CRAFT.lashPerJointM),
     glueG: r1((cutArea / 1_000_000) * cov.gluePerM2),
     lashJoints: joints,
     volumeL: r3(volumeL),
     ledCount: led,
-    surfaceM2: r3(bodySurfaceArea(frame.geometry, divisions) / 1_000_000)
+    surfaceM2: r3(bodySurfaceArea(frame.geometry, divisions) / 1_000_000),
+    fabricRolls,
+    fabricTotalM,
+    fabricSignature: usePattern ? pattern.signature : null
   }
 }
 

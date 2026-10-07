@@ -45,6 +45,10 @@ export const CRAFT = raw.craft as {
   defaultDivisions: number
   divMin: number
   divMax: number
+  defaultPatternBoltWidthMm: number
+  defaultPatternRepeatMm: number
+  defaultPatternOffsetMm: number
+  defaultPatternLapMm: number
   lashPerJointM: number
   led: { perLiter: number; min: number; rule: string }
 }

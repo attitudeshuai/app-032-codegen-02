@@ -2,12 +2,13 @@
  * 自检（对应规格书 §10 验收标准）
  * 每次参数变化都会重算全部几何并跑一遍断言，结果直接显示在界面上。
  */
-import type { CheckResult, Lantern } from './types'
+import type { CheckResult, Lantern, PatternPlan } from './types'
 import { bodySurfaceArea, polygonEdge, ringPerimeter, segmentInfos } from './geometry'
 import { buildFrame, type FrameResult } from './frame'
 import { buildPanels, panelNetArea, type PanelResult } from './panels'
 import { computeBatch, computeMaterials, type BatchMaterials, type SingleLightMaterials } from './materials'
 import { assertNoPanelSplit, paginate, type LoftOptions, type Sheet } from './paginate'
+import { buildPatternPlan, PATTERN_EPS } from './pattern'
 import { CRAFT } from './craft'
 
 export interface FullResult {
@@ -16,6 +17,7 @@ export interface FullResult {
   materials: SingleLightMaterials
   batch: BatchMaterials
   sheets: Sheet[]
+  pattern: PatternPlan
   checks: CheckResult[]
   elapsedMs: number
 }
@@ -27,12 +29,13 @@ export function computeAll(l: Lantern, loft: LoftOptions): FullResult {
   const t0 = performance.now()
   const frame = buildFrame(l)
   const panels = buildPanels(l)
-  const materials = computeMaterials(l)
+  const pattern = buildPatternPlan(l)
+  const materials = computeMaterials(l, pattern)
   const batch = computeBatch(materials, Math.max(1, Math.round(l.batchCount)), l.wasteRatio)
   const sheets = paginate(l, loft)
   const elapsedMs = performance.now() - t0
-  const checks = runChecks(l, frame, panels, materials, batch, sheets, elapsedMs)
-  return { frame, panels, materials, batch, sheets, checks, elapsedMs }
+  const checks = runChecks(l, frame, panels, materials, batch, sheets, pattern, elapsedMs)
+  return { frame, panels, materials, batch, sheets, pattern, checks, elapsedMs }
 }
 
 function runChecks(
@@ -42,6 +45,7 @@ function runChecks(
   materials: SingleLightMaterials,
   batch: BatchMaterials,
   sheets: Sheet[],
+  pattern: PatternPlan,
   elapsedMs: number
 ): CheckResult[] {
   const out: CheckResult[] = []
@@ -189,6 +193,122 @@ function runChecks(
       value: `${elapsedMs.toFixed(1)}ms`,
       detail: `${l.divisions} 等分 × ${l.layers.length} 层：构件 ${frame.totalQty} 根、裁片 ${panels.totalQty} 块、图纸 ${sheets.length} 页，全流程耗时 ${elapsedMs.toFixed(1)}ms（含分页）`
     })
+  }
+
+  // ---- CHK-09 取料周长与下刀段：首尾接起来 = 该层实际周长 ----
+  {
+    if (!pattern.enabled) {
+      out.push({
+        id: 'CHK-09',
+        title: '按花纹周期取料：周长/余数/下刀段（未启用）',
+        pass: true,
+        value: '未启用',
+        detail: '在蒙面裁片页填入布幅宽、花纹周期与花位偏移后，按层实际周长（轮廓+棱长周长那一路）给出每片下刀段'
+      })
+    } else if (!pattern.valid) {
+      out.push({ id: 'CHK-09', title: '按花纹周期取料：周长/余数/下刀段', pass: false, value: '输入无效', detail: pattern.invalidReason })
+    } else {
+      const bad: string[] = []
+      for (const ly of pattern.layers) {
+        const netSum = ly.pieces.reduce((a, p) => a + p.netWidthBottomMm, 0)
+        if (Math.abs(netSum - ly.perimeterBottomMm) > 0.15) bad.push(`${ly.label}净宽合计 ${f1(netSum)} ≠ 周长 ${f1(ly.perimeterBottomMm)}`)
+        // 下刀段首尾（含缝份/搭接）：Σ 净宽 + 2s×片数 + 搭接 1 道
+        const cutSum = ly.pieces.reduce((a, p) => a + p.cutLengthMm, 0)
+        const expect = ly.perimeterBottomMm + 2 * l.seamAllowanceMm * ly.pieceCount + l.pattern.lapMm
+        if (Math.abs(cutSum - expect) > 0.15) bad.push(`${ly.label}下刀段合计 ${f1(cutSum)} ≠ ${f1(expect)}`)
+        // 与既有周长路核对（多边形 n×棱长 / 圆 2πR）
+        const sec = frame.geometry.sections[ly.layerIndex]
+        const ref = ringPerimeter(sec.radiusMm, frame.geometry.n, frame.geometry.polygon)
+        if (Math.abs(ref - ly.perimeterBottomMm) > 0.15) bad.push(`${ly.label}周长 ${f1(ly.perimeterBottomMm)} 与轮廓/棱长周长 ${f1(ref)} 不一致`)
+      }
+      out.push({
+        id: 'CHK-09',
+        title: '取料：每层各片净宽首尾相接 = 该层实际周长（下刀段含缝份与合围搭接）',
+        pass: bad.length === 0,
+        value: bad.length === 0 ? `${pattern.layers.length}/${pattern.layers.length} 层一致` : `${bad.length} 层不一致`,
+        detail:
+          bad.length === 0
+            ? `全部层净宽合计 = 实际周长（走轮廓+棱长周长，非图上量取）；下刀段合计 = 周长 + 缝份 ${f1(l.seamAllowanceMm)}×2×片数 + 合围搭接 ${f1(l.pattern.lapMm)}mm；长度 mm、偏差 1 位小数、闭合容差 ${PATTERN_EPS}mm`
+            : bad.join('；')
+      })
+    }
+  }
+
+  // ---- CHK-10 三处同源：裁片页 / 材料页 / 作坊清单同一签名 ----
+  {
+    if (pattern.enabled && pattern.valid) {
+      // 材料页各色米数回算（模拟材料页/清单的独立取数）必须等于计划里的米数
+      const rollSum = pattern.rolls.reduce((a, r) => a + r.requiredLengthMm, 0)
+      const batchSum = pattern.rolls.reduce((a, r) => a + r.batchRequiredLengthMm, 0)
+      const sameTotal =
+        Math.abs(rollSum - pattern.totalRequiredMm) < 0.15 &&
+        Math.abs(batchSum - pattern.batchRequiredMm) < 0.3
+      // 每片都要有卷坐标且唯一（三处照同一串数下刀）
+      const coords = pattern.layers.flatMap((ly) => ly.pieces.map((p) => `${p.color}#${p.shelfIndex}#${f1(p.rollFromMm)}#${p.pieceIndex}`))
+      const dup = coords.length - new Set(coords).size
+      out.push({
+        id: 'CHK-10',
+        title: '三处同源：蒙面裁片页 / 材料页 / 作坊裁片清单同一取料结果（同一签名）',
+        pass: sameTotal && dup === 0,
+        value: `签名 ${pattern.signature}`,
+        detail:
+          sameTotal && dup === 0
+            ? `裁片页每片下刀段、材料页各色米数（单灯 ${f1(pattern.totalRequiredMm / 1000)}m / 批量 ${f1(pattern.batchRequiredMm / 1000)}m）、作坊清单行均取自本计划签名 ${pattern.signature}，同一片布三处下刀段与用布量一致`
+            : `三处取数出现分叉（合计差 ${f1(rollSum - pattern.totalRequiredMm)}mm，重复卷坐标 ${dup} 处），不允许导出`
+      })
+    } else {
+      out.push({ id: 'CHK-10', title: '三处同源：裁片页 / 材料页 / 作坊清单同一签名', pass: true, value: '未启用', detail: '启用按花纹周期取料后，三处共享同一 PatternPlan 与签名' })
+    }
+  }
+
+  // ---- CHK-11 相位：余数逐层累加，进层相位不被抹掉 ----
+  {
+    if (pattern.enabled && pattern.valid) {
+      const r = pattern.spec.repeatMm
+      let cum = ((pattern.spec.offsetMm % r) + r) % r
+      let bad = false
+      const trail: string[] = []
+      for (const ly of pattern.layers) {
+        if (Math.abs(ly.entryPhaseMm - (Math.round(cum * 10) / 10)) > 0.15) bad = true
+        trail.push(`L${ly.layerIndex + 1}余${f1(ly.remainderBottomMm)}→入${f1(ly.entryPhaseMm)}`)
+        cum = ((cum + ly.remainderBottomMm) % r + r) % r
+      }
+      out.push({
+        id: 'CHK-11',
+        title: '相位：每层周长÷周期的余数逐层累加，花位偏移/缝份先按 mm 再换算比例',
+        pass: !bad,
+        value: `花位 ${f1(pattern.spec.offsetMm)}mm（${(((pattern.spec.offsetMm % r) + r) % r / r) * 100}%）`,
+        detail:
+          `${trail.join('，')}；进层相位 = (花位偏移 + Σ下层余数) mod 周期；偏移与缝份先按 mm 算再除周期得比例（片上花位比例 4 位小数）；累计偏移未逐层归零${bad ? '；发现某层累计被抹掉！' : ''}`
+      })
+    } else {
+      out.push({ id: 'CHK-11', title: '相位：余数逐层累加 / 偏移不抹掉', pass: true, value: '未启用', detail: '启用后校验累计余数链' })
+    }
+  }
+
+  // ---- CHK-12 路线取舍与闭合：选错作废重裁的代价 ----
+  {
+    if (pattern.enabled && pattern.valid) {
+      const pass = pattern.spec.priority === 'cloth' || pattern.allClosable
+      out.push({
+        id: 'CHK-12',
+        title: `路线取舍：${pattern.spec.priority === 'match' ? '先保花纹严丝合缝' : '先保布头不浪费'}（二选一）`,
+        pass,
+        value:
+          pattern.spec.priority === 'match'
+            ? pattern.allClosable
+              ? `闭合成立（多吃布 ${f1(pattern.cost.matchExtraFabricMm / 1000)}m/灯）`
+              : `${pattern.openLayers.length} 层合围缝未闭合，须先选让步`
+            : `${pattern.cost.clothMismatchSeamCount} 条缝错开（最大 ${f1(pattern.cost.clothWorstMismatchMm)}mm），省布 ${f1(pattern.cost.clothSavedFabricMm / 1000)}m/灯`,
+        detail:
+          pattern.cost.note +
+          (pass
+            ? ''
+            : `；未闭合层：${pattern.openLayers.map((i) => i + 1).join('、')}。让步三选一：挪花位 / 改一层高度 / 认下背面一条缝。改路线即旧版连同已导出清单、已发作坊备料单一并作废，已下刀的片重裁、旧对位标记与拼缝次序失效。`)
+      })
+    } else {
+      out.push({ id: 'CHK-12', title: '路线取舍与闭合（未启用）', pass: true, value: '未启用', detail: '保花纹 / 保布头两条路只能选一条；选错的版本连同导出件作废重裁' })
+    }
   }
 
   return out

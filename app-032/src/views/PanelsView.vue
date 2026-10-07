@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PanelDiagram from '../components/PanelDiagram.vue'
+import PatternCutPanel from '../components/PatternCutPanel.vue'
 import ChecksPanel from '../components/ChecksPanel.vue'
 import { getLantern } from '../core/store'
 import { computeAll } from '../core/checks'
@@ -9,6 +10,7 @@ import { DEFAULT_LOFT_OPTIONS } from '../core/paginate'
 import { bodySurfaceArea } from '../core/geometry'
 import { downloadText, panelsCsv, shapeName } from '../core/exporter'
 import { coveringSpec } from '../core/craft'
+import { buildPatternPlan, diffPatternPlans } from '../core/pattern'
 
 const route = useRoute()
 const router = useRouter()
@@ -38,10 +40,42 @@ const palette = computed(() => {
   }))
 })
 
+/** 该面板种类（围向片）在取料计划里的各片下刀段（与作坊清单同一份结果） */
+function cutPiecesOf(panelId: string) {
+  const plan = full.value?.pattern
+  if (!plan || !plan.enabled) return null
+  const out = plan.layers.flatMap((ly) => ly.pieces.filter((pc) => pc.panelId === panelId))
+  return out.length ? out : null
+}
+
+/** 以最近一版未作废存档的参数重建当时计划，作为三处变化对照的基线 */
+const baselinePlan = computed(() => {
+  const l = lantern.value
+  const rec = l ? [...l.patternVersions].reverse().find((v) => !v.voided) : null
+  if (!l || !rec) return null
+  const ghost: typeof l = JSON.parse(JSON.stringify(l))
+  ghost.pattern = {
+    ...ghost.pattern,
+    repeatMm: rec.repeatMm,
+    offsetMm: rec.offsetMm,
+    boltWidthMm: rec.boltWidthMm,
+    lapMm: rec.lapMm,
+    priority: rec.priority,
+    acceptLayerIndex: rec.acceptLayerIndex
+  }
+  return buildPatternPlan(ghost)
+})
+
+const patternDiff = computed(() => diffPatternPlans(baselinePlan.value, full.value!.pattern))
+
 function exportCsv() {
   const l = lantern.value
   if (!l || !full.value) return
-  downloadText(`${l.name}-蒙面裁片清单.csv`, panelsCsv(l, full.value.panels.panels))
+  const plan = full.value.pattern
+  downloadText(
+    `${l.name}-蒙面裁片清单${plan.enabled ? '-' + plan.signature : ''}.csv`,
+    panelsCsv(l, full.value.panels.panels, plan.enabled ? plan : null, plan.enabled ? patternDiff.value : null)
+  )
 }
 </script>
 
@@ -65,6 +99,8 @@ function exportCsv() {
         <button class="primary" @click="router.push(`/print/${lantern.id}?view=labels`)">打印裁片标签</button>
       </div>
     </section>
+
+    <PatternCutPanel :lantern="lantern" :full="full" />
 
     <section class="stats">
       <div class="stat"><span>裁片总块数</span><b>{{ full.panels.totalQty }}</b></div>
@@ -106,6 +142,33 @@ function exportCsv() {
             </tr>
           </tbody>
         </table>
+
+        <table v-if="cutPiecesOf(p.id)" class="cuts">
+          <thead>
+            <tr><th colspan="5">按花纹周期取料 · 各片下刀段与对位标记（共 {{ cutPiecesOf(p.id)!.length }} 片，三处同源 {{ full.pattern.signature }}）</th></tr>
+            <tr><th>片</th><th>卷上下刀段 (mm)</th><th>下刀段长</th><th>左净边花位</th><th>缝偏差 下/上</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="pc in cutPiecesOf(p.id)" :key="pc.pieceIndex" :class="{ closing: pc.closing }">
+              <td class="mono">{{ pc.pieceIndex + 1 }}/{{ full.pattern.layers[pc.layerIndex].pieceCount }}<em v-if="pc.closing">合围片</em></td>
+              <td class="mono"><b>{{ pc.rollFromMm.toFixed(1) }}~{{ pc.rollToMm.toFixed(1) }}</b><span v-if="pc.gapBeforeMm" class="gap"> 空让{{ pc.gapBeforeMm.toFixed(1) }}</span></td>
+              <td class="mono">{{ pc.cutLengthMm.toFixed(1) }}</td>
+              <td class="mono">{{ pc.phaseStartMm.toFixed(1) }}mm<br /><small>{{ (pc.phaseStartRatio * 100).toFixed(2) }}%</small></td>
+              <td class="mono" :class="{ bad: Math.abs(pc.seam.mismatchBottomMm) > 0.05 || Math.abs(pc.seam.mismatchTopMm) > 0.05 }">
+                {{ pc.seam.mismatchBottomMm.toFixed(1) }}/{{ pc.seam.mismatchTopMm.toFixed(1) }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <details v-if="cutPiecesOf(p.id)">
+          <summary>对位标记明细（每片 {{ cutPiecesOf(p.id)![0].marksMm.length }} 处，随花位整批重排）</summary>
+          <div v-for="pc in cutPiecesOf(p.id)" :key="'m' + pc.pieceIndex" class="pc-marks">
+            <b>第 {{ pc.pieceIndex + 1 }} 片（{{ pc.label }}）：</b>
+            <ol>
+              <li v-for="(m, mi) in pc.marksMm" :key="mi">{{ m.label }}</li>
+            </ol>
+          </div>
+        </details>
         <p class="note">{{ p.note }}</p>
         <details>
           <summary>对位标记（{{ p.marksMm.length }} 处）</summary>
@@ -146,9 +209,9 @@ function exportCsv() {
     </section>
 
     <ChecksPanel
-      :checks="full.checks.filter((c) => ['CHK-03', 'CHK-05', 'CHK-06'].includes(c.id))"
+      :checks="full.checks.filter((c) => ['CHK-03', 'CHK-05', 'CHK-06', 'CHK-09', 'CHK-10', 'CHK-11', 'CHK-12'].includes(c.id))"
       :elapsed-ms="full.elapsedMs"
-      title="裁片与分页自检"
+      title="裁片与取料自检"
     />
   </div>
 </template>
@@ -327,6 +390,65 @@ button.primary:hover {
   margin: 0;
   font-size: 12px;
   color: var(--ink-soft);
+}
+
+.cuts {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.cuts th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-soft);
+  padding: 4px 6px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line);
+}
+
+.cuts thead tr:first-child th {
+  color: #8f1c19;
+}
+
+.cuts td {
+  padding: 4px 6px;
+  border-bottom: 1px dashed var(--line);
+}
+
+.cuts tr.closing {
+  background: #fff7f5;
+}
+
+.cuts tr.closing em {
+  display: block;
+  color: #b3241f;
+  font-style: normal;
+  font-size: 10.5px;
+}
+
+.cuts td.bad {
+  color: #b3241f;
+  font-weight: 600;
+}
+
+.cuts .gap {
+  color: #b07c18;
+  font-size: 10.5px;
+}
+
+.pc-marks {
+  font-size: 11.5px;
+  margin: 4px 0;
+}
+
+.pc-marks ol {
+  margin: 2px 0;
+  padding-left: 16px;
 }
 
 details {

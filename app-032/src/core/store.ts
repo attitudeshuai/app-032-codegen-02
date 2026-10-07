@@ -3,11 +3,25 @@
  * 灯型库与工艺参数来自本地打包 src/data/lantern-types.json，断网可用。
  */
 import { reactive, watch } from 'vue'
-import type { Lantern } from './types'
+import type { Lantern, PatternSpec, PatternVersionRecord } from './types'
 import { CRAFT, coveringSpec, presetById, PRESETS } from './craft'
 import { buildGeometry, effectiveHeight, r1 } from './geometry'
 
 const KEY = 'lantern-frame-lofting.v1'
+
+/** 取料参数缺省（绸布演示灯默认开） */
+export function defaultPatternSpec(enabled = false): PatternSpec {
+  return {
+    enabled,
+    boltWidthMm: CRAFT.defaultPatternBoltWidthMm,
+    repeatMm: CRAFT.defaultPatternRepeatMm,
+    offsetMm: CRAFT.defaultPatternOffsetMm,
+    lapMm: CRAFT.defaultPatternLapMm,
+    priority: 'match',
+    acceptLayerIndex: -1,
+    stockByColor: {}
+  }
+}
 
 interface StoreState {
   lanterns: Lantern[]
@@ -65,6 +79,8 @@ export function createFromPreset(presetId: string): Lantern {
     wasteRatio: coveringSpec(p.covering).wasteRatio,
     pageSize: 'A4',
     overlapMm: CRAFT.defaultOverlapMm,
+    pattern: defaultPatternSpec(p.covering === 'silk'),
+    patternVersions: [],
     createdAt: now,
     updatedAt: now
   }
@@ -119,6 +135,49 @@ export function removeLantern(id: string) {
   if (i >= 0) state.lanterns.splice(i, 1)
 }
 
+/** 旧档迁移：补齐按花纹周期取料字段与版本档 */
+function migrateLantern(raw: Lantern): Lantern {
+  const l = raw as Lantern
+  if (!l.pattern) l.pattern = defaultPatternSpec(l.covering === 'silk')
+  else l.pattern = { ...defaultPatternSpec(l.covering === 'silk'), ...l.pattern, stockByColor: { ...(l.pattern.stockByColor || {}) } }
+  if (!Array.isArray(l.patternVersions)) l.patternVersions = []
+  return l
+}
+
+/** 把当前周期与花位存档（本机灯样留这一版） */
+export function archivePatternVersion(l: Lantern, signature: string, note: string, issuedToWorkshop: boolean): PatternVersionRecord {
+  const rec: PatternVersionRecord = {
+    version: (l.patternVersions[l.patternVersions.length - 1]?.version || 0) + 1,
+    signature,
+    savedAt: new Date().toISOString(),
+    note,
+    repeatMm: l.pattern.repeatMm,
+    offsetMm: l.pattern.offsetMm,
+    boltWidthMm: l.pattern.boltWidthMm,
+    lapMm: l.pattern.lapMm,
+    priority: l.pattern.priority,
+    acceptLayerIndex: l.pattern.acceptLayerIndex,
+    issuedToWorkshop,
+    voided: false
+  }
+  l.patternVersions.push(rec)
+  return rec
+}
+
+/**
+ * 选错路：作废最近一版取料——已导出的裁片清单与已发作坊的备料单一起作废，
+ * 旧版对过花、下过刀的片要重裁，旧对位标记与拼缝次序失效。
+ */
+export function voidLatestPatternVersion(l: Lantern, reason: string, reCutPieces: string[]): PatternVersionRecord | null {
+  const rec = [...l.patternVersions].reverse().find((v) => !v.voided)
+  if (!rec) return null
+  rec.voided = true
+  rec.voidedAt = new Date().toISOString()
+  rec.voidReason = reason
+  rec.reCutPieces = reCutPieces
+  return rec
+}
+
 function persistNow() {
   suspendPersist = true
   try {
@@ -147,7 +206,7 @@ export function loadStore() {
     const raw = localStorage.getItem(KEY)
     if (raw) {
       const data = JSON.parse(raw) as { lanterns?: Lantern[] }
-      if (Array.isArray(data.lanterns)) state.lanterns = data.lanterns
+      if (Array.isArray(data.lanterns)) state.lanterns = data.lanterns.map(migrateLantern)
     }
   } catch {
     state.storageError = '本地灯样数据损坏，已重置'
@@ -176,6 +235,9 @@ export function useLanternStore() {
     duplicateLantern,
     removeLantern,
     distributeLayers,
-    syncLayerDiameters
+    syncLayerDiameters,
+    defaultPatternSpec,
+    archivePatternVersion,
+    voidLatestPatternVersion
   }
 }

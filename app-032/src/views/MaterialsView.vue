@@ -8,6 +8,7 @@ import { DEFAULT_LOFT_OPTIONS } from '../core/paginate'
 import { downloadText, materialsCsv } from '../core/exporter'
 import { coveringSpec, CRAFT } from '../core/craft'
 import { panelCutArea } from '../core/panels'
+import { buildPatternPlan, diffPatternPlans } from '../core/pattern'
 
 const route = useRoute()
 const router = useRouter()
@@ -19,6 +20,31 @@ const full = computed(() => {
 })
 
 const cov = computed(() => (lantern.value ? coveringSpec(lantern.value.covering) : null))
+
+const pattern = computed(() => full.value?.pattern || null)
+
+/** 与裁片页同一存档基线（三处变化对照） */
+const baselinePlan = computed(() => {
+  const l = lantern.value
+  const rec = l ? [...l.patternVersions].reverse().find((v) => !v.voided) : null
+  if (!l || !rec) return null
+  const ghost: typeof l = JSON.parse(JSON.stringify(l))
+  ghost.pattern = { ...ghost.pattern, repeatMm: rec.repeatMm, offsetMm: rec.offsetMm, boltWidthMm: rec.boltWidthMm, lapMm: rec.lapMm, priority: rec.priority, acceptLayerIndex: rec.acceptLayerIndex }
+  return buildPatternPlan(ghost)
+})
+const patternDiff = computed(() => (pattern.value ? diffPatternPlans(baselinePlan.value, pattern.value) : null))
+const changedColors = computed(() => new Set((patternDiff.value?.materials || []).filter((d) => d.key !== '__total__').map((d) => d.key)))
+
+/** 库存输入写回同一份取料参数（材料页判够不够，裁片页/清单不改） */
+function stockOf(color: string): number | null {
+  const v = lantern.value!.pattern.stockByColor[color]
+  return typeof v === 'number' && v > 0 ? v : null
+}
+function setStock(color: string, raw: number | string) {
+  const n = typeof raw === 'number' ? raw : parseFloat(raw)
+  if (isFinite(n) && n > 0) lantern.value!.pattern.stockByColor[color] = Math.round(n * 10) / 10
+  else delete lantern.value!.pattern.stockByColor[color]
+}
 
 const layerFabric = computed(() => {
   const l = lantern.value
@@ -42,7 +68,11 @@ const layerFabric = computed(() => {
 function exportCsv() {
   const l = lantern.value
   if (!l || !full.value) return
-  downloadText(`${l.name}-备料单.csv`, materialsCsv(l, full.value.materials, full.value.batch))
+  const plan = full.value.pattern
+  downloadText(
+    `${l.name}-备料单${plan.enabled ? '-' + plan.signature : ''}.csv`,
+    materialsCsv(l, full.value.materials, full.value.batch, plan.enabled ? plan : null, plan.enabled ? patternDiff.value : null)
+  )
 }
 </script>
 
@@ -75,6 +105,80 @@ function exportCsv() {
       <p class="formula mono">
         批量 = 单灯 × {{ Math.max(1, Math.round(lantern.batchCount)) }} × {{ (1 + lantern.wasteRatio).toFixed(2) }}
       </p>
+    </section>
+
+    <section v-if="pattern && pattern.enabled" class="fabric">
+      <header>
+        <h3>按花纹周期取料 · 各色绸布用量（与裁片页、作坊清单同源）</h3>
+        <span class="sig">签名 <b>{{ pattern.signature }}</b></span>
+      </header>
+      <p class="sub2">
+        幅宽 {{ pattern.spec.boltWidthMm }}mm / 周期 {{ pattern.spec.repeatMm }}mm / 花位 {{ pattern.spec.offsetMm }}mm / 合围搭接 {{ pattern.spec.lapMm }}mm
+        ｜路线 <b :class="pattern.spec.priority">{{ pattern.spec.priority === 'match' ? '先保花纹严丝合缝' : '先保布头不浪费' }}</b>
+        ｜单灯合计 <b>{{ (pattern.totalRequiredMm / 1000).toFixed(3) }}m</b>，批量 {{ full.batch.count }} 个 <b>{{ (pattern.batchRequiredMm / 1000).toFixed(3) }}m</b>
+        （米数取自同一份取料计划，不用图上面积凑）
+      </p>
+      <table class="rolls">
+        <thead>
+          <tr>
+            <th>颜色 / 用在哪</th>
+            <th class="num">幅宽排</th>
+            <th class="num">单灯卷长 (m)</th>
+            <th class="num">其中空耗布头 (mm)</th>
+            <th class="num">单灯面积 (m²)</th>
+            <th class="num">批量卷长 (m)</th>
+            <th>本卷库存 (m，填入判够不够)</th>
+            <th class="num">够不够裁批量</th>
+            <th>本版</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="r in pattern.rolls" :key="r.color" :class="{ changed: changedColors.has(r.color) }">
+            <td>
+              <span class="dot" :style="{ background: r.color }" />
+              <span class="mono">{{ r.color }}</span>
+              <small class="usedby">{{ r.usedBy.join('、') }}</small>
+            </td>
+            <td class="num mono">{{ r.shelves.length }} 排（每排最高 {{ Math.max(...r.shelves.map((s) => s.lengthMm)).toFixed(0) }}mm）</td>
+            <td class="num mono strong">{{ (r.requiredLengthMm / 1000).toFixed(3) }}</td>
+            <td class="num mono">{{ r.wasteLengthMm.toFixed(1) }}</td>
+            <td class="num mono">{{ r.requiredAreaM2.toFixed(3) }}</td>
+            <td class="num mono strong">{{ (r.batchRequiredLengthMm / 1000).toFixed(3) }}</td>
+            <td>
+              <input
+                type="number"
+                min="0"
+                step="0.1"
+                :value="stockOf(r.color) === null ? '' : stockOf(r.color)! / 1000"
+                @input="setStock(r.color, ($event.target as HTMLInputElement).value)"
+                placeholder="填米数"
+              />
+            </td>
+            <td class="num">
+              <b v-if="r.enough === true" class="ok">够裁（余 {{ (((r.stockLengthMm ?? 0) - r.batchRequiredLengthMm) / 1000).toFixed(3) }}m）</b>
+              <b v-else-if="r.enough === false" class="no">不够（还差 {{ ((r.batchRequiredLengthMm - (r.stockLengthMm ?? 0)) / 1000).toFixed(3) }}m）</b>
+              <span v-else class="muted">先填库存</span>
+            </td>
+            <td><span v-if="changedColors.has(r.color)" class="star">★米数变</span></td>
+          </tr>
+          <tr class="total">
+            <td>各色合计</td>
+            <td></td>
+            <td class="num mono strong">{{ (pattern.totalRequiredMm / 1000).toFixed(3) }}</td>
+            <td></td>
+            <td class="num mono">{{ pattern.totalRequiredM2.toFixed(3) }}</td>
+            <td class="num mono strong">{{ (pattern.batchRequiredMm / 1000).toFixed(3) }}</td>
+            <td colspan="3" class="muted">批量面积 {{ pattern.batchRequiredM2.toFixed(3) }}m²</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="cost-note">{{ pattern.cost.note }}</p>
+      <div v-if="patternDiff && patternDiff.changed" class="mdiff">
+        <b>改了周期/花位，材料页这些项跟着变（与裁片页、作坊清单整批重算、同一签名）：</b>
+        <ul>
+          <li v-for="(d, i) in patternDiff.materials" :key="i">{{ d.label }}：{{ d.before }} → {{ d.after }}（{{ d.detail }}）</li>
+        </ul>
+      </div>
     </section>
 
     <section class="tables">
@@ -410,5 +514,139 @@ tr.led td {
 .missing {
   padding: 40px;
   text-align: center;
+}
+
+.fabric {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 16px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.fabric header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.fabric h3 {
+  margin: 0;
+  font-size: 14px;
+  color: #8f1c19;
+}
+
+.sig b {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.sub2 {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.sub2 b.match {
+  color: #2f7a63;
+}
+
+.sub2 b.cloth {
+  color: #b07c18;
+}
+
+.rolls {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.rolls th {
+  text-align: left;
+  padding: 7px 10px;
+  background: var(--surface-2);
+  color: var(--ink-soft);
+  font-weight: 500;
+  font-size: 11.5px;
+  border-bottom: 1px solid var(--line);
+}
+
+.rolls td {
+  padding: 7px 10px;
+  border-bottom: 1px dashed var(--line);
+}
+
+.rolls tr.changed {
+  background: #fff7f5;
+}
+
+.rolls tr.total td {
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+.usedby {
+  display: block;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.rolls input {
+  width: 100px;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  padding: 4px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+}
+
+.ok {
+  color: #2f7a63;
+}
+
+.no {
+  color: #b3241f;
+}
+
+.muted {
+  color: var(--ink-soft);
+}
+
+.star {
+  color: #b3241f;
+  font-size: 11.5px;
+}
+
+.cost-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+  background: var(--surface-2);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.mdiff {
+  font-size: 12px;
+  border: 1px dashed #e2b4ad;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.mdiff ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
 </style>

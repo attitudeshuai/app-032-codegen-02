@@ -7,6 +7,10 @@
     "defaultDivisions": 24,
     "divMin": 6,
     "divMax": 96,
+    "defaultPatternBoltWidthMm": 900,
+    "defaultPatternRepeatMm": 150,
+    "defaultPatternOffsetMm": 0,
+    "defaultPatternLapMm": 10,
     "lashPerJointM": 0.5,
     "led": {
       "perLiter": 0.35,
