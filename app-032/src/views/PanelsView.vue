@@ -41,8 +41,16 @@ const palette = computed(() => {
 function exportCsv() {
   const l = lantern.value
   if (!l || !full.value) return
-  downloadText(`${l.name}-蒙面裁片清单.csv`, panelsCsv(l, full.value.panels.panels))
+  downloadText(`${l.name}-蒙面裁片清单.csv`, panelsCsv(l, full.value.panels.panels, full.value.pattern))
 }
+
+/** 按花纹周期取料：按层/片查同一份结果里的下刀段 */
+const cutGroups = computed(() => {
+  const plan = full.value?.pattern
+  if (!plan || !plan.enabled || !plan.supported) return []
+  return plan.layers.map((L) => ({ layer: L, segs: plan.segments.filter((s) => s.layer === L.layer) }))
+})
+const patternPlan = computed(() => full.value?.pattern ?? null)
 </script>
 
 <template>
@@ -72,6 +80,40 @@ function exportCsv() {
       <div class="stat"><span>含缝份裁片面积</span><b>{{ (full.panels.cutAreaMm2 / 1e6).toFixed(3) }} m²</b></div>
       <div class="stat"><span>灯体表面积</span><b>{{ full.materials.surfaceM2.toFixed(3) }} m²</b></div>
       <div class="stat"><span>净面积 / 表面积</span><b>{{ (ratio * 100).toFixed(2) }}%</b></div>
+    </section>
+
+    <section v-if="patternPlan?.enabled && patternPlan.supported" class="pattern-link card-mini">
+      <div class="pl-head">
+        <h3>按花纹周期取料 v{{ patternPlan.version }}（{{ patternPlan.strategy === 'match' ? '先保花纹严丝合缝' : '先保布头不浪费' }}）</h3>
+        <router-link :to="`/pattern/${lantern!.id}`" class="go">去取料页改周期 / 花位 / 让步 →</router-link>
+      </div>
+      <p class="pl-sub">
+        下列每片下刀段（mm，1 位小数）与对位标记、材料页各色用布、导出作坊的裁片清单，
+        三处同源于取料页那一份结果；周期 {{ patternPlan.repeatMm.toFixed(1) }}mm /
+        花位 {{ patternPlan.phaseOffsetMm.toFixed(1) }}mm / 缝份 {{ patternPlan.seamAllowanceMm.toFixed(1) }}mm /
+        让布 {{ patternPlan.extraClothTotalMm.toFixed(1) }}mm / 错花缝 {{ patternPlan.errorSeamCount }} 道。
+      </p>
+      <div v-for="g in cutGroups" :key="g.layer.layer" class="pl-layer">
+        <h4>第 {{ g.layer.layer }} 层（{{ g.segs.length }} 片，周长 {{ g.layer.perimeterMm.toFixed(1) }}mm，余 {{ g.layer.remainderMm.toFixed(1) }}mm）</h4>
+        <table class="pl-table">
+          <thead>
+            <tr>
+              <th class="num">片</th><th class="num">下刀段(mm)</th><th class="num">入口花位(mm)</th>
+              <th class="num">周期比</th><th class="num">视觉错(mm)</th><th>对位标记</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in g.segs" :key="s.piece" :class="{ err: s.isErrorSeam }">
+              <td class="num mono">{{ s.piece }}</td>
+              <td class="num mono">{{ s.startMm.toFixed(1) }}~{{ s.endMm.toFixed(1) }}</td>
+              <td class="num mono">{{ s.phaseStartMm.toFixed(1) }}</td>
+              <td class="num mono">{{ s.phaseStartRatio.toFixed(3) }}</td>
+              <td class="num mono" :class="s.isErrorSeam ? 'bad' : 'ok'">{{ s.seamErrorMm.toFixed(1) }}</td>
+              <td class="pl-marks">{{ s.matchMarks.join('；') }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </section>
 
     <div class="cards">
@@ -146,7 +188,7 @@ function exportCsv() {
     </section>
 
     <ChecksPanel
-      :checks="full.checks.filter((c) => ['CHK-03', 'CHK-05', 'CHK-06'].includes(c.id))"
+      :checks="full.checks.filter((c) => ['CHK-03', 'CHK-05', 'CHK-06', 'CHK-09'].includes(c.id))"
       :elapsed-ms="full.elapsedMs"
       title="裁片与分页自检"
     />
@@ -383,5 +425,98 @@ ol {
 .missing {
   padding: 40px;
   text-align: center;
+}
+
+.card-mini {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 16px;
+  box-shadow: var(--shadow);
+}
+
+.pl-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.pl-head h3 {
+  margin: 0;
+  font-size: 14px;
+  color: #8f1c19;
+}
+
+.go {
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.pl-sub {
+  margin: 6px 0 10px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.pl-layer {
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+  margin-top: 8px;
+}
+
+.pl-layer h4 {
+  margin: 4px 0;
+  font-size: 12.5px;
+}
+
+.pl-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+
+.pl-table th {
+  text-align: left;
+  color: var(--ink-soft);
+  font-weight: 500;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.pl-table td {
+  padding: 3px 8px;
+  border-bottom: 1px dashed var(--line);
+  vertical-align: top;
+}
+
+.pl-table tr.err td {
+  background: #fdf0ec;
+}
+
+.num {
+  text-align: right;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.ok {
+  color: var(--jade);
+}
+
+.bad {
+  color: var(--red);
+}
+
+.pl-marks {
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+tr.err .pl-marks {
+  color: #8f1c19;
 }
 </style>

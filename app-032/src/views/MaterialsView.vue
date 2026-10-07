@@ -8,6 +8,7 @@ import { DEFAULT_LOFT_OPTIONS } from '../core/paginate'
 import { downloadText, materialsCsv } from '../core/exporter'
 import { coveringSpec, CRAFT } from '../core/craft'
 import { panelCutArea } from '../core/panels'
+import { stockStatus } from '../core/pattern'
 
 const route = useRoute()
 const router = useRouter()
@@ -42,8 +43,18 @@ const layerFabric = computed(() => {
 function exportCsv() {
   const l = lantern.value
   if (!l || !full.value) return
-  downloadText(`${l.name}-备料单.csv`, materialsCsv(l, full.value.materials, full.value.batch))
+  downloadText(`${l.name}-备料单.csv`, materialsCsv(l, full.value.materials, full.value.batch, full.value.pattern))
 }
+
+/** 按花纹周期取料：各色绸布用布与库存（与裁片页/作坊清单同一份结果） */
+const fabricRows = computed(() => {
+  const plan = full.value?.pattern
+  if (!plan || !plan.enabled || !plan.supported) return null
+  return plan.tallies.map((t) => {
+    const stock = lantern.value!.pattern.stockByColor[t.color]
+    return { ...t, stockMm: stock ?? null, status: stockStatus(t, stock, plan.batchCount, plan.wasteRatio) }
+  })
+})
 </script>
 
 <template>
@@ -162,6 +173,64 @@ function exportCsv() {
             <td class="num mono">{{ (r.perPiece / 1e6).toFixed(4) }}</td>
             <td class="num mono">{{ r.qty }}</td>
             <td class="num mono">{{ r.areaM2.toFixed(3) }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section v-if="fabricRows" class="palette">
+      <h3>
+        按花纹周期取料 · 各色绸布（v{{ full.pattern.version }}，
+        {{ full.pattern.strategy === 'match' ? '先保花纹严丝合缝' : '先保布头不浪费' }}；
+        与裁片页、作坊清单同源）
+      </h3>
+      <p class="rule">
+        周期 {{ full.pattern.repeatMm.toFixed(1) }}mm / 花位 {{ full.pattern.phaseOffsetMm.toFixed(1) }}mm /
+        缝份 {{ full.pattern.seamAllowanceMm.toFixed(1) }}mm；为对花让出布头合计
+        <b>{{ full.pattern.extraClothTotalMm.toFixed(1) }}mm</b>，认下错花缝
+        <b>{{ full.pattern.errorSeamCount }} 道</b>（返工 {{ full.pattern.reworkMinutes }} 分钟）。
+        <router-link :to="`/pattern/${lantern!.id}`">去取料页查看让步办法与每片下刀段 →</router-link>
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>颜色</th>
+            <th class="num">涉及层</th>
+            <th class="num">幅宽 (mm)</th>
+            <th class="num">单灯下刀总长 (mm)</th>
+            <th class="num">其中对花让出 (mm)</th>
+            <th class="num">用布 (m²)</th>
+            <th class="num">批量×损耗需 (mm)</th>
+            <th class="num">手头库存 (mm)</th>
+            <th class="num">够不够 / 差 (mm)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="r in fabricRows" :key="r.color">
+            <td>
+              <span class="dot" :style="{ background: r.color }" />
+              <span class="mono">{{ r.color }}</span>
+            </td>
+            <td class="num mono">{{ r.layers.join('/') }}</td>
+            <td class="num mono">{{ r.fabricWidthMm.toFixed(1) }}</td>
+            <td class="num mono strong">{{ r.usedMm.toFixed(1) }}</td>
+            <td class="num mono">{{ r.extraForMatchMm.toFixed(1) }}</td>
+            <td class="num mono">{{ r.usedM2.toFixed(3) }}</td>
+            <td class="num mono">{{ r.status.needMm.toFixed(1) }}</td>
+            <td class="num">
+              <input
+                class="stock-in"
+                type="number"
+                min="0"
+                step="10"
+                placeholder="未填"
+                :value="r.stockMm ?? ''"
+                @change="(e) => { const v = Number((e.target as HTMLInputElement).value) || 0; lantern!.pattern.stockByColor[r.color] = v }"
+              />
+            </td>
+            <td class="num mono" :class="r.stockMm == null ? '' : r.status.enough ? 'ok' : 'bad'">
+              {{ r.stockMm == null ? '填库存判定' : r.status.enough ? '够裁' : `不够，差 ${r.status.shortMm.toFixed(1)}` }}
+            </td>
           </tr>
         </tbody>
       </table>
@@ -410,5 +479,17 @@ tr.led td {
 .missing {
   padding: 40px;
   text-align: center;
+}
+
+.stock-in {
+  width: 110px;
+}
+
+.ok {
+  color: var(--jade);
+}
+
+.bad {
+  color: var(--red);
 }
 </style>

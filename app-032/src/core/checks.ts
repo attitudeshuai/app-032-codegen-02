@@ -9,6 +9,7 @@ import { buildPanels, panelNetArea, type PanelResult } from './panels'
 import { computeBatch, computeMaterials, type BatchMaterials, type SingleLightMaterials } from './materials'
 import { assertNoPanelSplit, paginate, type LoftOptions, type Sheet } from './paginate'
 import { CRAFT } from './craft'
+import { planPatternCutting, stockStatus, type PatternPlanResult } from './pattern'
 
 export interface FullResult {
   frame: FrameResult
@@ -16,6 +17,7 @@ export interface FullResult {
   materials: SingleLightMaterials
   batch: BatchMaterials
   sheets: Sheet[]
+  pattern: PatternPlanResult
   checks: CheckResult[]
   elapsedMs: number
 }
@@ -30,9 +32,10 @@ export function computeAll(l: Lantern, loft: LoftOptions): FullResult {
   const materials = computeMaterials(l)
   const batch = computeBatch(materials, Math.max(1, Math.round(l.batchCount)), l.wasteRatio)
   const sheets = paginate(l, loft)
+  const pattern = planPatternCutting(l)
   const elapsedMs = performance.now() - t0
-  const checks = runChecks(l, frame, panels, materials, batch, sheets, elapsedMs)
-  return { frame, panels, materials, batch, sheets, checks, elapsedMs }
+  const checks = runChecks(l, frame, panels, materials, batch, sheets, pattern, elapsedMs)
+  return { frame, panels, materials, batch, sheets, pattern, checks, elapsedMs }
 }
 
 function runChecks(
@@ -42,6 +45,7 @@ function runChecks(
   materials: SingleLightMaterials,
   batch: BatchMaterials,
   sheets: Sheet[],
+  pattern: PatternPlanResult,
   elapsedMs: number
 ): CheckResult[] {
   const out: CheckResult[] = []
@@ -191,7 +195,80 @@ function runChecks(
     })
   }
 
+  // ---- CHK-09 按花纹周期取料：净段闭合 + 相位不抹零 + 三处同源 ----
+  {
+    if (!pattern.enabled || !pattern.supported) {
+      out.push({
+        id: 'CHK-09',
+        title: '按花纹周期取料（净段闭合 / 相位累加 / 三处同源）',
+        pass: true,
+        value: '未启用',
+        detail: pattern.unsupportedReason || '未开启按花纹周期取料；裁片尺寸仍按缝份路径计算。'
+      })
+    } else {
+      const fails: string[] = []
+      // ① 每层净段首尾相接 = 该层实际周长（展示为 1 位小数，按片数放宽舍入容差）
+      for (const lr of pattern.layers) {
+        const segs = pattern.segments.filter((x) => x.layer === lr.layer)
+        const rawSum = segs.reduce((a, x) => a + (x.lengthMm - 2 * pattern.seamAllowanceMm), 0)
+        const tolLen = 0.05 * segs.length + 0.1
+        if (Math.abs(rawSum - lr.perimeterMm) > tolLen) {
+          fails.push(`第 ${lr.layer} 层净段合计 ${f1(rawSum)}mm ≠ 实际周长 ${f1(lr.perimeterMm)}mm`)
+        }
+      }
+      // ② 累计花位逐层累加：进入该层的原值 = 以前各同色层周长之和（偏移没被抹掉）
+      for (const lr of pattern.layers) {
+        const expectAcc = accByColor(pattern, lr.layer, lr.color)
+        const tolAcc = 0.05 * lr.pieces * Math.max(1, lr.layer - 1) + 0.1
+        if (Math.abs(lr.carriedRawMm - expectAcc) > tolAcc) {
+          fails.push(`第 ${lr.layer} 层累计花位原值 ${f1(lr.carriedRawMm)}mm 与以前各同色层周长累计 ${f1(expectAcc)}mm 不符（偏移被逐层抹掉）`)
+        }
+      }
+      // ③ 三处同源：材料页用布 = 裁片页刀口并集 + 各层闭合搭接；让出的布头 = 用布 − 净排布
+      for (const t of pattern.tallies) {
+        const segs = pattern.segments.filter((x) => x.color === t.color)
+        const maxEnd = segs.reduce((a, x) => Math.max(a, x.endMm), 0)
+        const minStart = segs.reduce((a, x) => Math.min(a, x.startMm), 0)
+        const lapLayers = new Set(segs.map((x) => x.layer)).size
+        const lapTotal = lapLayers * Math.max(0, l.overlapMm)
+        const expectUsed = maxEnd - minStart + lapTotal
+        const tolSpan = 0.05 * segs.length + 0.2
+        if (Math.abs(expectUsed - t.usedMm) > tolSpan) {
+          fails.push(`颜色 ${t.color}：裁片页刀口并集+搭接 ${f1(expectUsed)}mm ≠ 材料页用布 ${f1(t.usedMm)}mm（三处不同源）`)
+        }
+        const span = segs.reduce((a, x) => a + x.lengthMm, 0)
+        const expectExtra = t.usedMm - (span + lapTotal)
+        if (Math.abs(expectExtra - t.extraForMatchMm) > tolSpan) {
+          fails.push(`颜色 ${t.color}：让出布头 ${f1(t.extraForMatchMm)}mm 与排刀空档 ${f1(expectExtra)}mm 不符`)
+        }
+        const st = stockStatus(t, l.pattern.stockByColor[t.color], pattern.batchCount, pattern.wasteRatio)
+        if (!st.enough && st.haveMm > 0) {
+          fails.push(`颜色 ${t.color}：手头 ${f1(st.haveMm)}mm 不够裁（含批量损耗需 ${f1(st.needMm)}mm，差 ${f1(st.shortMm)}mm）`)
+        }
+      }
+      out.push({
+        id: 'CHK-09',
+        title: '按花纹周期取料：净段闭合 = 实际周长、相位逐层累加、三处同源',
+        pass: fails.length === 0,
+        value: fails.length === 0 ? '通过' : `${fails.length} 项不通过`,
+        detail:
+          fails.length === 0
+            ? `每层各片净段（剥掉缝份）首尾相接与该层实际周长一致（误差 ≤0.1mm）；同色各层余数逐层累加不取整；裁片页/材料页/作坊清单同一份排刀结果，各色用布 = 刀口并集 + 闭合搭接。`
+            : fails.join('；')
+      })
+    }
+  }
+
   return out
+}
+
+function accByColor(pattern: PatternPlanResult, beforeLayer: number, color: string): number {
+  let acc = 0
+  for (const lr of pattern.layers) {
+    if (lr.layer >= beforeLayer) break
+    if (lr.color === color) acc += lr.perimeterMm
+  }
+  return acc
 }
 
 function suggestDivisions(l: Lantern, netArea: number, ratio: number): number | null {

@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import LanternPreview from '../components/LanternPreview.vue'
 import ChecksPanel from '../components/ChecksPanel.vue'
-import { getLantern, distributeLayers, syncLayerDiameters } from '../core/store'
+import { getLantern, distributeLayers, syncLayerDiameters, bumpPatternVersion } from '../core/store'
 import { computeAll } from '../core/checks'
 import { DEFAULT_LOFT_OPTIONS } from '../core/paginate'
 import { buildGeometry, polyhedronInfo, r1 } from '../core/geometry'
@@ -80,6 +80,14 @@ function onCovering(e: Event) {
   const v = (e.target as HTMLSelectElement).value as Lantern['covering']
   l.covering = v
   l.wasteRatio = coveringSpec(v).wasteRatio
+}
+
+/** 缝份变化会改变下刀段：若已启用对花取料，取料版次作废一版 */
+function onSeamChange(v: number) {
+  const l = lantern.value
+  if (!l) return
+  l.seamAllowanceMm = Math.max(0, v)
+  if (l.pattern?.enabled) bumpPatternVersion(l)
 }
 
 function setSides(e: Event) {
@@ -255,7 +263,14 @@ function onCtrl(v: { which: 1 | 2; x: number; y: number }) {
       <div class="row">
         <div class="field">
           <label>缝份（每边 mm）</label>
-          <input v-model.number="lantern.seamAllowanceMm" type="number" min="0" max="40" step="1" />
+          <input
+            :value="lantern.seamAllowanceMm"
+            type="number"
+            min="0"
+            max="40"
+            step="1"
+            @change="(e) => onSeamChange(Number((e.target as HTMLInputElement).value) || 0)"
+          />
         </div>
         <div class="field">
           <label>绑扎余量（每端 mm）</label>

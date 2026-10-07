@@ -17,6 +17,7 @@ const nav = computed(() => {
     { to: `/design/${id}`, label: '参数与预览' },
     { to: `/frame/${id}`, label: '骨架件表' },
     { to: `/panels/${id}`, label: '蒙面裁片' },
+    { to: `/pattern/${id}`, label: '对花取料' },
     { to: `/print/${id}`, label: '1:1 放样图' },
     { to: `/materials/${id}`, label: '材料与备料' }
   ]

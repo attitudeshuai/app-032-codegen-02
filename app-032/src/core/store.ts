@@ -6,6 +6,7 @@ import { reactive, watch } from 'vue'
 import type { Lantern } from './types'
 import { CRAFT, coveringSpec, presetById, PRESETS } from './craft'
 import { buildGeometry, effectiveHeight, r1 } from './geometry'
+import { defaultPatternPlan, makeIssue, planPatternCutting, patternSignature } from './pattern'
 
 const KEY = 'lantern-frame-lofting.v1'
 
@@ -65,6 +66,7 @@ export function createFromPreset(presetId: string): Lantern {
     wasteRatio: coveringSpec(p.covering).wasteRatio,
     pageSize: 'A4',
     overlapMm: CRAFT.defaultOverlapMm,
+    pattern: defaultPatternPlan(),
     createdAt: now,
     updatedAt: now
   }
@@ -94,6 +96,43 @@ export function distributeLayers(l: Lantern) {
   syncLayerDiameters(l)
 }
 
+/** 旧版灯样（没有 pattern 字段）补齐按花纹周期取料的存档结构 */
+function migrateLantern(l: Lantern): Lantern {
+  if (!l.pattern) {
+    l.pattern = defaultPatternPlan()
+  } else {
+    const d = defaultPatternPlan()
+    const p = l.pattern as unknown as Record<string, unknown>
+    if (p.stockByColor === undefined) l.pattern.stockByColor = {}
+    if (typeof p.version !== 'number') l.pattern.version = d.version
+    if (p.issued === undefined) l.pattern.issued = null
+  }
+  return l
+}
+
+/**
+ * 改一次花纹周期 / 花位偏移 / 路线 / 幅宽 / 公差：版次 +1。
+ * 已发布的旧版（旧取料结果 + 旧清单 + 旧备料单）即整版作废，由差异表列出。
+ */
+export function bumpPatternVersion(l: Lantern) {
+  l.pattern.version += 1
+  l.updatedAt = new Date().toISOString()
+}
+
+/** 发布当前版给作坊：把这一版的周期、花位、下刀段与各色用布存进灯样存档 */
+export function issuePatternPlan(l: Lantern) {
+  const plan = planPatternCutting(l)
+  l.pattern.issued = makeIssue(plan)
+  l.updatedAt = new Date().toISOString()
+  return l.pattern.issued
+}
+
+/** 当前取料指纹相对存档（便于不渲染结果时快速判断是否已发布最新版） */
+export function patternInSync(l: Lantern): boolean {
+  const iss = l.pattern.issued
+  return !!iss && iss.signature === patternSignature(l)
+}
+
 export function addLantern(l: Lantern) {
   state.lanterns.unshift(l)
   return l
@@ -107,8 +146,12 @@ export function duplicateLantern(id: string): Lantern | undefined {
   const src = getLantern(id)
   if (!src) return undefined
   const copy: Lantern = JSON.parse(JSON.stringify(src))
+  migrateLantern(copy)
   copy.id = makeId()
   copy.name = src.name + ' 副本'
+  // 副本没有发过作坊，已发布快照作废，版次从 1 重新记
+  copy.pattern.issued = null
+  copy.pattern.version = 1
   copy.createdAt = copy.updatedAt = new Date().toISOString()
   state.lanterns.unshift(copy)
   return copy
@@ -122,7 +165,10 @@ export function removeLantern(id: string) {
 function persistNow() {
   suspendPersist = true
   try {
-    for (const l of state.lanterns) syncLayerDiameters(l)
+    for (const l of state.lanterns) {
+      migrateLantern(l)
+      syncLayerDiameters(l)
+    }
     localStorage.setItem(KEY, JSON.stringify({ version: 1, lanterns: state.lanterns }))
     state.storageError = ''
   } catch (e) {
@@ -147,7 +193,7 @@ export function loadStore() {
     const raw = localStorage.getItem(KEY)
     if (raw) {
       const data = JSON.parse(raw) as { lanterns?: Lantern[] }
-      if (Array.isArray(data.lanterns)) state.lanterns = data.lanterns
+      if (Array.isArray(data.lanterns)) state.lanterns = data.lanterns.map(migrateLantern)
     }
   } catch {
     state.storageError = '本地灯样数据损坏，已重置'
@@ -176,6 +222,9 @@ export function useLanternStore() {
     duplicateLantern,
     removeLantern,
     distributeLayers,
-    syncLayerDiameters
+    syncLayerDiameters,
+    bumpPatternVersion,
+    issuePatternPlan,
+    patternInSync
   }
 }
